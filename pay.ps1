@@ -359,6 +359,63 @@ try {
 try { Unblock-File -LiteralPath $MsiPath -ErrorAction SilentlyContinue } catch { }
 
 # --------------------------------------------------------------------------
+# 1625 evidence collector - only runs when msiexec refuses the package
+# --------------------------------------------------------------------------
+function Get-MsiBlockEvidence {
+    Write-Log '[*] collecting block evidence (msiexec refused before installing)'
+
+    try {
+        foreach ($p in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer',
+                         'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer')) {
+            $d = (Get-ItemProperty -Path $p -Name DisableMSI -ErrorAction SilentlyContinue).DisableMSI
+            if ($null -eq $d) { Write-Log ('[*] policy ' + $p + ' DisableMSI=<not set>') }
+            else { Write-Log ('[!] policy ' + $p + ' DisableMSI=' + $d + '  (2 = all MSI forbidden)') }
+            $a = (Get-ItemProperty -Path $p -Name AlwaysInstallElevated -ErrorAction SilentlyContinue).AlwaysInstallElevated
+            if ($null -ne $a) { Write-Log ('[*] policy ' + $p + ' AlwaysInstallElevated=' + $a) }
+        }
+    } catch { Write-Log ('[-] policy read failed: ' + $_.Exception.Message) }
+
+    try {
+        $eff = Get-AppLockerPolicy -Effective -ErrorAction Stop
+        foreach ($type in @('Exe', 'Msi', 'Script', 'Dll')) {
+            $coll = $eff.RuleCollections | Where-Object { $_.RuleCollectionType -eq $type }
+            if ($coll) { Write-Log ('[*] applocker ' + $type + ' enforcement=' + $coll.EnforcementMode + ' rules=' + (@($coll.Rules | Where-Object { $_ })).Count) }
+        }
+    } catch { Write-Log '[*] applocker: no policy or module unavailable' }
+
+    try {
+        $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop
+        Write-Log ('[*] wdac ci=' + $dg.CodeIntegrityPolicyEnforcementStatus + ' usermode=' + $dg.UsermodeCodeIntegrityPolicyEnforcementStatus)
+    } catch { Write-Log '[*] wdac: unavailable' }
+
+    try {
+        $sac = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+        Write-Log ('[*] smartappcontrol=' + $(if ($null -eq $sac) { 'absent' } else { $sac }))
+    } catch { }
+
+    try {
+        $pref = Get-MpPreference -ErrorAction Stop
+        if ($pref.AttackSurfaceReductionRules_Ids) { Write-Log ('[*] asr rules=' + @($pref.AttackSurfaceReductionRules_Ids).Count) }
+        else { Write-Log '[*] asr rules=none' }
+    } catch { Write-Log '[*] asr: unavailable' }
+
+    try {
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; StartTime = (Get-Date).AddMinutes(-10) } -ErrorAction Stop)
+        $begun = @($ev | Where-Object { $_.Id -eq 1040 }).Count
+        Write-Log ('[*] msi events last10m=' + $ev.Count + ' transactions_begun=' + $begun)
+        if ($begun -eq 0) {
+            Write-Log '[!] no 1040 event: msiexec refused before the transaction started - configuration, not permissions'
+        }
+        foreach ($e in ($ev | Where-Object { $_.Id -in @(1033, 11707, 11708, 11925) } | Select-Object -First 4)) {
+            Write-Log ('[*] msi event id=' + $e.Id + ' ' + (($e.Message -replace '\r?\n', ' | ').Trim()))
+        }
+    } catch {
+        Write-Log ('[*] event log: ' + $_.Exception.Message)
+        Write-Log '[!] no MSI transaction events in the last 10 min - msiexec rejected the package before it started'
+    }
+}
+
+# --------------------------------------------------------------------------
 # install
 # --------------------------------------------------------------------------
 $MsiArgs = '/i "' + $MsiPath + '" /qn /norestart /l*v "' + $MsiLog + '"'
@@ -372,7 +429,14 @@ try {
     $why = $map[$proc.ExitCode]
     if (-not $why) { $why = 'unmapped' }
     Write-Log ('[+] msiexec exit=' + $proc.ExitCode + ' (' + $why + ') in ' + $iw.ElapsedMilliseconds + 'ms, log ' + $MsiLog)
-    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { exit 4 }
+    if ($proc.ExitCode -eq 1625) {
+        Write-Log '[!] 1625 = package rejected by system policy, before any install work began'
+        Get-MsiBlockEvidence
+    }
+    if ($proc.ExitCode -eq 1638) {
+        Write-Log '[*] 1638 = this version is already installed - verifying instead of reinstalling'
+    }
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010 -and $proc.ExitCode -ne 1638) { exit 4 }
 } catch {
     Write-Log ('[-] install failed: ' + $_.Exception.Message)
     exit 4
